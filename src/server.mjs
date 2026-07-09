@@ -1,4 +1,5 @@
 import express from "express"
+import compression from "compression"
 import { fileURLToPath } from "url"
 import { dirname, join } from "path"
 import {
@@ -6,10 +7,15 @@ import {
   repoCommitTimeline, contributorCommits, trends, TREND_RANGES, teamDirectory, dataStatus,
   activityPunchcard, workflowInsights, reviewHealth, issueInsights,
 } from "./metrics.mjs"
-import { db } from "./db.mjs"
+import { db, warmPool } from "./db.mjs"
 
 const app = express()
 app.disable("x-powered-by") // don't advertise the framework/version
+
+// gzip everything (JSON + the static SPA). Chart.js alone is ~200KB raw and the
+// org-wide JSON payloads run tens of KB — compression is a 4-6x transfer cut.
+// No BREACH-style concern: responses never mix secrets with user-echoed input.
+app.use(compression())
 
 // ---------------------------------------------------------------------------
 // Security headers on every response. The CSP is strict because all JS/CSS is
@@ -194,7 +200,10 @@ app.get("/api/contributor/:login/commits", guard("contributor commits", async (r
 app.use("/api", (_req, res) => res.status(404).json({ error: "not found" }))
 
 const PORT = Number(process.env.DASHBOARD_PORT || 4000)
-const server = app.listen(PORT, () => console.log(`dev-metrics dashboard on http://localhost:${PORT}`))
+const server = app.listen(PORT, () => {
+  console.log(`dev-metrics dashboard on http://localhost:${PORT}`)
+  warmPool().then(() => console.log("db pool warmed"))
+})
 
 // Graceful shutdown: stop accepting connections, drain the pg pool, then exit.
 // A hard cap guards against a stuck connection hanging the process forever.

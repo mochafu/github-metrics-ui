@@ -12,6 +12,16 @@ node src/server.mjs        # http://localhost:4000  (DASHBOARD_PORT to override)
 `.env` needs only `DATABASE_URL` (the Supabase **pooler** string — same one the
 collector writes to; if they differ, the dashboard shows stale data).
 
+> **Pooler mode note:** a `:5432` URL is Supabase's *session-mode* pooler — each
+> dashboard connection pins a pooler slot for its lifetime, and the slot budget
+> is shared with the collector. The pool is therefore capped at `max: 10` in
+> `src/db.mjs` (raising it causes rejected connections → 500s during page-load
+> bursts, especially while a backfill is running). If the dashboard ever needs
+> more concurrency, switch this app's `DATABASE_URL` to the *transaction-mode*
+> pooler (port `6543`): its connections are multiplexed per-statement, so they
+> are cheap and don't compete with the collector. This code is compatible —
+> single-statement `pool.query` only, no session state or LISTEN/NOTIFY.
+
 ## Philosophy
 
 - **Team-level insight, not individual scoring.** There is deliberately no

@@ -1585,8 +1585,9 @@ function route() {
 // once, at the start, instead of fetching per view. The VISIBLE set (current
 // range + WBR 6w/12m + team + status) fires immediately — the first paint reuses
 // those exact promises, so it isn't slowed down. The remaining ranges warm in
-// the background afterwards (one at a time, to respect the 10-connection pool),
-// so switching ranges is instant. Repo/contributor detail stays lazy: eagerly
+// the background afterwards (one at a time, so background warming never
+// competes with a visible view for the server's pool), so switching ranges
+// is instant. Repo/contributor detail stays lazy: eagerly
 // loading all 71 repos' detail would swamp the pool with no visible benefit.
 function prefetchAll() {
   const primary = [

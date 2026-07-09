@@ -44,6 +44,43 @@ export async function deploymentEvents(repoId) {
   return { method: "none", events: [] }
 }
 
+// Org-wide deploy signal WITHOUT the per-repo N+1: one bucketed GROUP BY per
+// ladder rung (4 queries total, constant in repo count), then the same
+// first-non-empty-rung choice as deploymentEvents made per repo in JS. The
+// old shape — deploymentEvents() for each repo — cost up to 4 round-trips × N
+// repos per /api/trends call (~300 queries for this org) and was the whole
+// reason trends took seconds. Rung choice counts ALL rows (even null
+// timestamps, matching deploymentEvents); null timestamps just yield a null
+// bucket that callers skip.
+async function orgDeployRungBuckets(bucketExpr) {
+  const [dep, rel, mrg, ci] = await Promise.all([
+    rows(
+      `select repo_id, ${bucketExpr("created_at")} b, count(*)::int n
+       from deployments where status='success' group by 1, 2`
+    ),
+    rows(
+      `select repo_id, ${bucketExpr("published_at")} b, count(*)::int n
+       from releases where coalesce(draft,false)=false and published_at is not null group by 1, 2`
+    ),
+    rows(
+      `select repo_id, ${bucketExpr("merged_at")} b, count(*)::int n
+       from pull_requests where merged_at is not null and base_branch = any($1) group by 1, 2`,
+      [MAIN]
+    ),
+    rows(
+      `select repo_id, ${bucketExpr("created_at")} b, count(*)::int n
+       from workflow_runs where conclusion='success' and head_branch = any($1) group by 1, 2`,
+      [MAIN]
+    ),
+  ])
+  return [
+    { method: "GitHub Deployments",     rows: dep },
+    { method: "Releases (proxy)",       rows: rel },
+    { method: "Merges to main (proxy)", rows: mrg },
+    { method: "CI on main (proxy)",     rows: ci },
+  ]
+}
+
 // deploys per week over the active span, from count + first/last timestamps.
 // Taking (count, min, max) instead of the full event list keeps the org-wide
 // overview to a handful of GROUP BY queries no matter how many repos exist.
@@ -85,7 +122,7 @@ export async function repoStats(repoId = null) {
   const F = repoId ? "where repo_id=$1" : "" // for queries with no other where-clause
   const p = repoId ? [repoId] : []
 
-  const [repos, commitAgg, prAgg, ciAgg, cfrAgg, mttrAgg, issueAgg, depRung, relRung, mergeRung, ciRung, authorAgg] =
+  const [repos, commitAgg, prAgg, ciAgg, cfrAgg, mttrAgg, issueAgg, rungAgg, authorAgg] =
     await Promise.all([
       rows(`select id, full_name from repos ${repoId ? "where id=$1" : ""} order by full_name`, p),
 
@@ -170,27 +207,23 @@ export async function repoStats(repoId = null) {
       ),
 
       // Deploy-signal ladder, aggregated: (count, first, last) per rung per repo.
+      // All 4 rungs ride ONE round-trip via UNION ALL — they were 4 separate
+      // queries, and against a remote pooler the trip costs more than the scan.
       rows(
-        `select repo_id, count(*)::int n, min(created_at) mn, max(created_at) mx
-         from deployments where status='success' ${repoId ? "and repo_id=$1" : ""} group by repo_id`,
-        p
-      ),
-      rows(
-        `select repo_id, count(*)::int n, min(published_at) mn, max(published_at) mx
-         from releases where coalesce(draft,false)=false and published_at is not null
-           ${repoId ? "and repo_id=$1" : ""} group by repo_id`,
-        p
-      ),
-      rows(
-        `select repo_id, count(*)::int n, min(merged_at) mn, max(merged_at) mx
-         from pull_requests where merged_at is not null and base_branch = any($1)
-           ${repoId ? "and repo_id=$2" : ""} group by repo_id`,
-        repoId ? [MAIN, repoId] : [MAIN]
-      ),
-      rows(
-        `select repo_id, count(*)::int n, min(created_at) mn, max(created_at) mx
-         from workflow_runs where conclusion='success' and head_branch = any($1)
-           ${repoId ? "and repo_id=$2" : ""} group by repo_id`,
+        `select 'dep' rung, repo_id, count(*)::int n, min(created_at) mn, max(created_at) mx
+           from deployments where status='success' ${repoId ? "and repo_id=$2" : ""} group by repo_id
+         union all
+         select 'rel', repo_id, count(*)::int, min(published_at), max(published_at)
+           from releases where coalesce(draft,false)=false and published_at is not null
+             ${repoId ? "and repo_id=$2" : ""} group by repo_id
+         union all
+         select 'mrg', repo_id, count(*)::int, min(merged_at), max(merged_at)
+           from pull_requests where merged_at is not null and base_branch = any($1)
+             ${repoId ? "and repo_id=$2" : ""} group by repo_id
+         union all
+         select 'ci', repo_id, count(*)::int, min(created_at), max(created_at)
+           from workflow_runs where conclusion='success' and head_branch = any($1)
+             ${repoId ? "and repo_id=$2" : ""} group by repo_id`,
         repoId ? [MAIN, repoId] : [MAIN]
       ),
 
@@ -225,11 +258,12 @@ export async function repoStats(repoId = null) {
     for (const n of counts) { cum += n; bf++; if (cum * 2 >= total) break }
     return { busFactor: bf, topShare: counts[0] / total }
   }
+  const rungRows = (key) => rungAgg.filter((r) => r.rung === key)
   const rungs = [
-    { method: "GitHub Deployments",     map: byRepo(depRung) },
-    { method: "Releases (proxy)",       map: byRepo(relRung) },
-    { method: "Merges to main (proxy)", map: byRepo(mergeRung) },
-    { method: "CI on main (proxy)",     map: byRepo(ciRung) },
+    { method: "GitHub Deployments",     map: byRepo(rungRows("dep")) },
+    { method: "Releases (proxy)",       map: byRepo(rungRows("rel")) },
+    { method: "Merges to main (proxy)", map: byRepo(rungRows("mrg")) },
+    { method: "CI on main (proxy)",     map: byRepo(rungRows("ci")) },
   ]
 
   return repos.map((r) => {
@@ -287,28 +321,23 @@ export async function overview(range = "12m") {
   const def = RANGE_DEFS[range] || RANGE_DEFS["12m"]
   const RS = (col) => (def.since ? `and ${col} >= ${def.since}` : "")
 
-  const [repos, lead, contributorsRow, active30Row, rangeContribRow, rangeLeadRow] = await Promise.all([
+  // All-time / 30-day / in-range variants of the same aggregate are FILTER
+  // clauses on ONE scan, not separate queries — the DB is remote, so each
+  // avoided query is an avoided round-trip. (`where true ${RS(...)}` degrades
+  // to an unfiltered aggregate for the "all" range, matching the old queries.)
+  const [repos, lead, contrib] = await Promise.all([
     repoStats(),
     one(
-      `select percentile_cont(0.5) within group (order by extract(epoch from (merged_at-created_at))/3600.0) p50
+      `select percentile_cont(0.5) within group (order by extract(epoch from (merged_at-created_at))/3600.0) p50,
+              percentile_cont(0.5) within group (order by extract(epoch from (merged_at-created_at))/3600.0)
+                filter (where true ${RS("merged_at")}) p50_range
        from pull_requests where merged_at is not null`
     ),
     one(
-      `select count(distinct author_login)::int n from commits
-       where author_login is not null and author_is_bot is not true`
-    ),
-    one(
-      `select count(distinct author_login)::int n from commits
-       where author_login is not null and author_is_bot is not true
-         and authored_at >= now() - interval '30 days'`
-    ),
-    one(
-      `select count(distinct author_login)::int n from commits
-       where author_login is not null and author_is_bot is not true ${RS("authored_at")}`
-    ),
-    one(
-      `select percentile_cont(0.5) within group (order by extract(epoch from (merged_at-created_at))/3600.0) p50
-       from pull_requests where merged_at is not null ${RS("merged_at")}`
+      `select count(distinct author_login)::int n,
+              count(distinct author_login) filter (where authored_at >= now() - interval '30 days')::int n_30d,
+              count(distinct author_login) filter (where true ${RS("authored_at")})::int n_range
+       from commits where author_login is not null and author_is_bot is not true`
     ),
   ])
   const sum = (f) => repos.reduce((a, r) => a + (f(r) || 0), 0)
@@ -324,8 +353,8 @@ export async function overview(range = "12m") {
       commits: sum((r) => r.commits),
       deployEvents: sum((r) => r.deployCount),
       leadTimeP50h: asNum(lead?.p50),
-      contributors: contributorsRow.n,
-      activeContributors30d: active30Row.n,
+      contributors: contrib.n,
+      activeContributors30d: contrib.n_30d,
       issuesOpen: sum((r) => r.issuesOpen),
       issuesClosed: sum((r) => r.issuesClosed),
       ciPassRate: (() => {
@@ -337,8 +366,8 @@ export async function overview(range = "12m") {
     range,
     // Range-scoped figures for the top KPI cards (see note above).
     rangeExtras: {
-      contributors: rangeContribRow.n,      // distinct authors who committed in-range
-      leadTimeP50h: asNum(rangeLeadRow.p50), // median PR open→merge for merges in-range
+      contributors: contrib.n_range,        // distinct authors who committed in-range
+      leadTimeP50h: asNum(lead?.p50_range), // median PR open→merge for merges in-range
     },
     freshness: { latestEvent: latest, generatedAt: new Date().toISOString() },
   }
@@ -460,28 +489,42 @@ export async function trends(range, repoId = null) {
     ),
   ])
 
-  // Deploy events reuse the per-repo signal ladder, then get bucketed here.
+  // Deploy series: the per-repo signal ladder, bucketed to match the SQL series.
+  // The cutoff is bucket-aligned (sinceDateJs), so filtering by bucket key is
+  // exactly the old per-event date filter.
+  const cutoff = sinceDateJs(range)
+  const cutoffKey = cutoff ? bucketKeyFor(trunc, cutoff) : null
   let deployMethod = "none"
-  let deployEvents = []
+  const deployBuckets = {}
   if (repoId) {
     const dep = await deploymentEvents(repoId)
     deployMethod = dep.method
-    deployEvents = dep.events
+    for (const e of dep.events) {
+      if (!e.ts) continue
+      const k = bucketKeyFor(trunc, new Date(e.ts))
+      if (cutoffKey && k < cutoffKey) continue
+      deployBuckets[k] = (deployBuckets[k] || 0) + 1
+    }
   } else {
-    const repos = await rows(`select id from repos`)
-    const deps = await Promise.all(repos.map((r) => deploymentEvents(r.id)))
-    deployEvents = deps.flatMap((d) => d.events)
-    const methods = new Set(deps.filter((d) => d.method !== "none").map((d) => d.method))
+    // 4 org-wide queries instead of 4 × N-repos; same ladder, same buckets.
+    const rungs = await orgDeployRungBuckets((col) => `to_char(date_trunc('${trunc}', ${col}), '${key}')`)
+    const chosen = new Map() // repo_id -> { method, rows } for its first non-empty rung
+    for (const rung of rungs) {
+      for (const r of rung.rows) {
+        let e = chosen.get(r.repo_id)
+        if (!e) chosen.set(r.repo_id, (e = { method: rung.method, rows: [] }))
+        if (e.method === rung.method) e.rows.push(r)
+      }
+    }
+    const methods = new Set()
+    for (const { method, rows: rs } of chosen.values()) {
+      methods.add(method)
+      for (const r of rs) {
+        if (!r.b || (cutoffKey && r.b < cutoffKey)) continue
+        deployBuckets[r.b] = (deployBuckets[r.b] || 0) + r.n
+      }
+    }
     deployMethod = methods.size === 0 ? "none" : methods.size === 1 ? [...methods][0] : "mixed (per-repo proxies)"
-  }
-  const cutoff = sinceDateJs(range)
-  const deployBuckets = {}
-  for (const e of deployEvents) {
-    if (!e.ts) continue
-    const d = new Date(e.ts)
-    if (cutoff && d < cutoff) continue
-    const k = bucketKeyFor(trunc, d)
-    deployBuckets[k] = (deployBuckets[k] || 0) + 1
   }
 
   // Zero-fill from the first observed (or range-start) bucket through now.
