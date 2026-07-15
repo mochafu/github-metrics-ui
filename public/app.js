@@ -295,8 +295,10 @@ function deltaFor(metric, buckets, noun = "period") {
 
 // ------------------------------------------------------------------- modal
 let modalChart = null;
+let aiAbort = null; // in-flight AI report fetch; aborted when its modal closes
 function closeModal() {
   if (modalChart) { modalChart.destroy(); modalChart = null; }
+  if (aiAbort) { aiAbort.abort(); aiAbort = null; } // stop paying for a report nobody is reading
   const root = $("#modal-root");
   root.hidden = true;
   root.innerHTML = "";
@@ -452,6 +454,227 @@ function openMetricModal(metricId, scope = {}) {
   root.querySelectorAll("[data-modal-tabs] .range-tab").forEach((b) =>
     b.addEventListener("click", () => { range = b.dataset.r; draw(); }));
   draw();
+}
+
+// ======================================================================== AI
+// Report modal + Ask-AI drawer. Both render model-generated MARKDOWN through
+// mdToHtml below — every character is esc()'d before any inline formatting is
+// applied, so model output can never inject markup (same rule as API JSON).
+
+// --- tiny markdown renderer (headings, lists, tables, code, bold/links) ----
+function mdInline(s) {
+  // s is already HTML-escaped; formatting is layered on top of escaped text.
+  return s
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\s][^*]*)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((#\/[^\s)]*)\)/g, '<a href="$2">$1</a>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+}
+function mdToHtml(md) {
+  const lines = (md || "").replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let para = [];
+  const flushPara = () => {
+    if (para.length) { out.push(`<p>${mdInline(esc(para.join(" ")))}</p>`); para = []; }
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (/^```/.test(l)) { // fenced code
+      flushPara();
+      const buf = [];
+      for (i++; i < lines.length && !/^```/.test(lines[i]); i++) buf.push(lines[i]);
+      out.push(`<pre><code>${esc(buf.join("\n"))}</code></pre>`);
+      continue;
+    }
+    // table = pipe row followed by a |---|---| separator row
+    if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      flushPara();
+      const cells = (row) => row.trim().replace(/^\||\|$/g, "").split("|").map((c) => mdInline(esc(c.trim())));
+      const head = cells(l);
+      const body = [];
+      for (i += 2; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]); i++) body.push(cells(lines[i]));
+      i--;
+      out.push(`<table><thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${
+        body.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
+      continue;
+    }
+    const h = l.match(/^(#{1,4})\s+(.*)/);
+    if (h) { flushPara(); const n = Math.min(h[1].length + 1, 5); out.push(`<h${n}>${mdInline(esc(h[2]))}</h${n}>`); continue; }
+    if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(l)) { flushPara(); out.push("<hr>"); continue; }
+    if (/^\s*>\s?/.test(l)) { // blockquote
+      flushPara();
+      const buf = [];
+      for (; i < lines.length && /^\s*>\s?/.test(lines[i]); i++) buf.push(lines[i].replace(/^\s*>\s?/, ""));
+      i--;
+      out.push(`<blockquote>${mdInline(esc(buf.join(" ")))}</blockquote>`);
+      continue;
+    }
+    const ul = /^\s*[-*+]\s+(.*)/, ol = /^\s*\d+[.)]\s+(.*)/;
+    if (ul.test(l) || ol.test(l)) { // flat lists (nesting renders flattened)
+      flushPara();
+      const ordered = ol.test(l), re = ordered ? ol : ul;
+      const items = [];
+      for (; i < lines.length && re.test(lines[i]); i++) items.push(mdInline(esc(lines[i].match(re)[1])));
+      i--;
+      out.push(`<${ordered ? "ol" : "ul"}>${items.map((x) => `<li>${x}</li>`).join("")}</${ordered ? "ol" : "ul"}>`);
+      continue;
+    }
+    if (!l.trim()) { flushPara(); continue; }
+    para.push(l.trim());
+  }
+  flushPara();
+  return `<div class="md">${out.join("")}</div>`;
+}
+
+// --------------------------------------------------------- AI report modal
+// GET /api/report streams markdown; re-render the accumulated text per chunk
+// (reports are a few KB — re-parsing is cheap and keeps the code simple).
+function openReportModal() {
+  const root = $("#modal-root");
+  root.innerHTML = `
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal modal-ai" role="dialog" aria-modal="true" aria-label="AI engineering report">
+      <div class="modal-head">
+        <div>
+          <div class="modal-title">AI Engineering Report</div>
+          <div class="modal-sub">generated from live metrics · ${esc(RANGE_LABEL[state.range] || state.range)}</div>
+        </div>
+        <button class="btn" data-regen>Regenerate</button>
+        <button class="modal-x" data-close aria-label="Close">×</button>
+      </div>
+      <div class="ai-report-body" data-body></div>
+    </div>`;
+  root.hidden = false;
+  document.addEventListener("keydown", modalEsc);
+  root.querySelectorAll("[data-close]").forEach((el) => el.addEventListener("click", closeModal));
+  $("[data-regen]", root).addEventListener("click", () => run(true));
+
+  const pendingHtml = (label) => `<div class="ai-pending">${esc(label)}<span class="ai-dots">…</span></div>`;
+
+  async function run(refresh) {
+    if (aiAbort) aiAbort.abort();
+    const ctrl = (aiAbort = new AbortController());
+    const body = $("[data-body]", root);
+    body.innerHTML = pendingHtml("Analyzing metrics");
+    let text = "";
+    try {
+      const res = await fetch(
+        `/api/report?range=${encodeURIComponent(state.range)}${refresh ? "&refresh=1" : ""}`,
+        { signal: ctrl.signal });
+      if (!res.ok) {
+        let msg = "HTTP " + res.status;
+        try { msg = (await res.json()).error || msg; } catch { /* keep status msg */ }
+        throw new Error(msg);
+      }
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        text += dec.decode(value, { stream: true });
+        body.innerHTML = mdToHtml(text) + pendingHtml("Writing");
+      }
+      body.innerHTML = mdToHtml(text);
+    } catch (e) {
+      if (ctrl.signal.aborted) return; // modal closed mid-stream
+      body.innerHTML = `<div class="ai-error">Report failed: ${esc(e.message)}</div>`;
+    } finally {
+      if (aiAbort === ctrl) aiAbort = null;
+    }
+  }
+  run(false);
+}
+
+// ------------------------------------------------------------ Ask AI drawer
+const TOOL_LABEL = {
+  get_overview: "reading org overview",
+  get_trends: "reading trends",
+  get_review_health: "checking review health",
+  get_issue_insights: "checking issues",
+  get_workflow_insights: "checking CI workflows",
+  get_activity_punchcard: "reading activity punchcard",
+  get_team_directory: "reading team directory",
+  get_weekly_digest: "reading weekly digest",
+  get_data_status: "checking data freshness",
+};
+const ask = { history: [], busy: false };
+
+function askIntroHtml() {
+  const qs = [
+    "How is engineering health trending over the last 12 months?",
+    "Which repos are slowing down the most?",
+    "Which CI workflows are flaky or slow?",
+    "How healthy is our review process?",
+  ];
+  return `<div class="ask-msg assistant"><div class="md"><p>Ask me anything about the metrics — I answer from the same data the dashboard charts are built on.</p></div>
+    <div class="ask-suggest">${qs.map((q) => `<button class="ask-chip" data-q="${esc(q)}">${esc(q)}</button>`).join("")}</div></div>`;
+}
+function openAskDrawer() { $("#ask-drawer").hidden = false; $("#ask-input").focus(); }
+function closeAskDrawer() { $("#ask-drawer").hidden = true; }
+
+async function sendAsk(q) {
+  if (ask.busy) return;
+  ask.busy = true;
+  $("#ask-send").disabled = true;
+  const msgs = $("#ask-msgs");
+  msgs.insertAdjacentHTML("beforeend", `<div class="ask-msg user">${esc(q)}</div>`);
+  ask.history.push({ role: "user", content: q });
+  msgs.insertAdjacentHTML("beforeend",
+    `<div class="ask-msg assistant pending"><div class="ai-pending">Thinking<span class="ai-dots">…</span></div><div class="ask-steps"></div></div>`);
+  const bubble = msgs.lastElementChild;
+  msgs.scrollTop = msgs.scrollHeight;
+  try {
+    // Send a window of recent turns; the server requires it to start and end
+    // with a user message, so trim any leading assistant turn off the window.
+    const win = ask.history.slice(-12);
+    while (win.length && win[0].role !== "user") win.shift();
+    const res = await fetch("/api/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: win }),
+    });
+    if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { msg = (await res.json()).error || msg; } catch { /* keep status msg */ }
+      throw new Error(msg);
+    }
+    // NDJSON stream: tool/ping progress lines, then one answer or error line.
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "", answer = null, errMsg = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.type === "tool") {
+          $(".ask-steps", bubble).insertAdjacentHTML("beforeend",
+            `<div class="ask-step">→ ${esc(TOOL_LABEL[ev.name] || ev.name)}${ev.detail ? " (" + esc(ev.detail) + ")" : ""}</div>`);
+          msgs.scrollTop = msgs.scrollHeight;
+        } else if (ev.type === "answer") answer = ev.markdown;
+        else if (ev.type === "error") errMsg = ev.message;
+      }
+    }
+    if (answer == null) throw new Error(errMsg || "no answer received");
+    bubble.classList.remove("pending");
+    bubble.innerHTML = mdToHtml(answer);
+    ask.history.push({ role: "assistant", content: answer });
+  } catch (e) {
+    bubble.classList.remove("pending");
+    bubble.innerHTML = `<div class="ai-error">${esc(e.message)}</div>`;
+    ask.history.pop(); // failed turn stays visible but out of the transcript we resend
+  } finally {
+    ask.busy = false;
+    $("#ask-send").disabled = false;
+    msgs.scrollTop = msgs.scrollHeight;
+  }
 }
 
 // -------------------------------------------------------------- KPI render
@@ -1628,6 +1851,33 @@ function boot() {
       route(); // re-render current view with the new range
     });
   }
+
+  // AI: report modal + ask drawer
+  $("#ai-report-btn").addEventListener("click", openReportModal);
+  $("#ai-ask-btn").addEventListener("click", () =>
+    ($("#ask-drawer").hidden ? openAskDrawer() : closeAskDrawer()));
+  $("#ask-close").addEventListener("click", closeAskDrawer);
+  $("#ask-clear").addEventListener("click", () => {
+    if (ask.busy) return;
+    ask.history = [];
+    $("#ask-msgs").innerHTML = askIntroHtml();
+  });
+  $("#ask-msgs").innerHTML = askIntroHtml();
+  $("#ask-msgs").addEventListener("click", (e) => {
+    const chip = e.target.closest(".ask-chip");
+    if (chip && !ask.busy) sendAsk(chip.dataset.q);
+  });
+  $("#ask-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = $("#ask-input");
+    const q = input.value.trim();
+    if (!q || ask.busy) return;
+    input.value = "";
+    sendAsk(q);
+  });
+  $("#ask-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#ask-form").requestSubmit(); }
+  });
 
   window.addEventListener("hashchange", route);
   prefetchAll(); // kick off all dashboard-level fetches at once

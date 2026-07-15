@@ -9,8 +9,10 @@ npm install
 node src/server.mjs        # http://localhost:4000  (DASHBOARD_PORT to override)
 ```
 
-`.env` needs only `DATABASE_URL` (the Supabase **pooler** string — same one the
-collector writes to; if they differ, the dashboard shows stale data).
+`.env` needs `DATABASE_URL` (the Supabase **pooler** string — same one the
+collector writes to; if they differ, the dashboard shows stale data), and
+`ANTHROPIC_API_KEY` to enable the AI report + Ask-AI features (optional —
+everything else works without it; see *AI endpoints* below).
 
 > **Pooler mode note:** a `:5432` URL is Supabase's *session-mode* pooler — each
 > dashboard connection pins a pooler slot for its lifetime, and the slot budget
@@ -53,11 +55,28 @@ collector writes to; if they differ, the dashboard shows stale data).
 | `GET /api/repo/:id/contributors` | per-contributor stats for one repo |
 | `GET /api/contributor/:login` | cross-repo profile |
 | `GET /api/contributor/:login/commits` | commits for the profile activity chart |
+| `GET /api/report?range=…[&refresh=1]` | **AI** — streamed markdown report (downtrends / uptrends / summary) for the range; served from a 15-min server cache unless `refresh=1` |
+| `POST /api/ask` `{messages:[{role,content}…]}` | **AI** — free-form Q&A; streams NDJSON (`start` → `tool`/`ping` progress → `answer`/`error`) |
 
 DORA coverage: deployment frequency (`deployPerWeek` + method), lead time
 (PR open→merge p50/p90 — a proxy; true DORA is commit→deploy), change failure
 rate (failed CI on the default branch), time-to-restore (median red-streak →
 next green on the default branch).
+
+### AI endpoints
+
+Both AI routes call Claude (`claude-opus-4-8`; override with `AI_MODEL`) and
+require `ANTHROPIC_API_KEY` in `.env` — without it they answer 503 and the rest
+of the app is unaffected. The report is one model call over a JSON snapshot
+assembled from the endpoints above (deterministic, no retrieval). Q&A runs a
+tool-use loop where the model's only tools are read-only wrappers of the same
+metric functions the charts use — it never writes SQL and can't see anything
+the dashboard can't show. Both routes carry the project's editorial policy in
+the system prompt: team-level framing (no individual leaderboards) and honest
+proxy labeling. Guardrails: 12 AI calls / 10 min / IP, max 3 in flight
+org-wide, model calls aborted when the client disconnects. Cost is roughly
+$0.10–0.35 per uncached report (the snapshot is ~60 KB of JSON) and usage is
+logged per call (`ai report …` / `ai ask …` lines).
 
 ## How each metric is calculated
 

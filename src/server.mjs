@@ -7,6 +7,7 @@ import {
   repoCommitTimeline, contributorCommits, trends, TREND_RANGES, teamDirectory, dataStatus,
   activityPunchcard, workflowInsights, reviewHealth, issueInsights,
 } from "./metrics.mjs"
+import { aiConfigured, cachedReport, generateReport, answerQuestion } from "./ai.mjs"
 import { db, warmPool } from "./db.mjs"
 
 const app = express()
@@ -195,6 +196,119 @@ app.get("/api/contributor/:login/commits", guard("contributor commits", async (r
   if (!login) return res.status(400).json({ error: "invalid login" })
   res.json(await contributorCommits(login))
 }))
+
+// ---------------------------------------------------------------------------
+// AI routes. These cost real money per call (one Opus request each), so they
+// get their own, much tighter limiter on top of the general /api one, plus a
+// global in-flight cap so a burst can't fan out into parallel model calls.
+// Both routes stream; "no-transform" opts them out of compression(), which
+// would otherwise buffer the stream into one flush at the end.
+// ---------------------------------------------------------------------------
+const AI_LIMIT = 12 // AI calls per window per IP
+const AI_WINDOW_MS = 600_000
+const AI_MAX_IN_FLIGHT = 3
+const aiHits = new Map()
+let aiInFlight = 0
+setInterval(() => {
+  const now = Date.now()
+  for (const [ip, rec] of aiHits) if (now - rec.start > AI_WINDOW_MS) aiHits.delete(ip)
+}, AI_WINDOW_MS).unref()
+
+function aiGate(req, res) {
+  if (!aiConfigured()) {
+    res.status(503).json({ error: "AI is not configured — set ANTHROPIC_API_KEY in .env and restart" })
+    return false
+  }
+  const now = Date.now()
+  let rec = aiHits.get(req.ip)
+  if (!rec || now - rec.start > AI_WINDOW_MS) {
+    rec = { start: now, n: 0 }
+    aiHits.set(req.ip, rec)
+  }
+  if (++rec.n > AI_LIMIT) {
+    res.status(429).json({ error: "AI rate limit exceeded — try again in a few minutes" })
+    return false
+  }
+  if (aiInFlight >= AI_MAX_IN_FLIGHT) {
+    res.status(429).json({ error: "too many AI requests in flight — try again shortly" })
+    return false
+  }
+  return true
+}
+
+// Streamed markdown report for the selected range. Served from a short-lived
+// server-side cache unless ?refresh=1; the client renders chunks as they land.
+app.get("/api/report", async (req, res) => {
+  if (!aiGate(req, res)) return
+  const range = TREND_RANGES.includes(req.query.range) ? req.query.range : "12m"
+  res.set({ "Content-Type": "text/markdown; charset=utf-8", "Cache-Control": "no-store, no-transform" })
+  if (req.query.refresh !== "1") {
+    const hit = cachedReport(range)
+    if (hit) { res.set("X-Report-Cache", "hit"); return res.end(hit) }
+  }
+  // Stop paying for tokens the moment the client goes away (modal closed).
+  const ctrl = new AbortController()
+  res.on("close", () => ctrl.abort())
+  aiInFlight++
+  try {
+    res.flushHeaders()
+    await generateReport(range, (t) => res.write(t), ctrl.signal)
+    res.end()
+  } catch (e) {
+    if (ctrl.signal.aborted) return // client left; nothing to answer
+    console.error("report error:", e)
+    if (res.headersSent) res.end("\n\n> **Report generation failed.** Try regenerating in a moment.")
+    else res.status(500).json({ error: "report generation failed" })
+  } finally {
+    aiInFlight--
+  }
+})
+
+// Free-form Q&A. Body: {messages: [{role: "user"|"assistant", content}, ...]}
+// ending with the user's question. Streams NDJSON: {type:"start"} → zero or
+// more {type:"tool"|"ping"} progress lines → one {type:"answer"|"error"}.
+function validAskMessages(body) {
+  const m = body && body.messages
+  if (!Array.isArray(m) || m.length < 1 || m.length > 24) return null
+  for (const t of m) {
+    if (!t || (t.role !== "user" && t.role !== "assistant")) return null
+    if (typeof t.content !== "string" || !t.content.trim() || t.content.length > 6000) return null
+  }
+  if (m[0].role !== "user" || m[m.length - 1].role !== "user") return null
+  return m.map((t) => ({ role: t.role, content: t.content }))
+}
+
+const askBody = express.json({ limit: "32kb" })
+app.post("/api/ask",
+  (req, res, next) => askBody(req, res, (err) => (err ? res.status(400).json({ error: "invalid JSON body" }) : next())),
+  async (req, res) => {
+    if (!aiGate(req, res)) return
+    const messages = validAskMessages(req.body)
+    if (!messages) {
+      return res.status(400).json({ error: "body must be {messages: [{role, content}, ...]} starting and ending with a user message" })
+    }
+    res.set({ "Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-store, no-transform" })
+    res.flushHeaders()
+    const send = (obj) => res.write(JSON.stringify(obj) + "\n")
+    send({ type: "start" })
+    const ping = setInterval(() => send({ type: "ping" }), 10_000) // keep proxies from idling us out
+    const ctrl = new AbortController()
+    res.on("close", () => ctrl.abort())
+    aiInFlight++
+    try {
+      const markdown = await answerQuestion(messages, send, ctrl.signal)
+      send({ type: "answer", markdown })
+    } catch (e) {
+      if (!ctrl.signal.aborted) {
+        console.error("ask error:", e)
+        send({ type: "error", message: "answer generation failed — try again" })
+      }
+    } finally {
+      clearInterval(ping)
+      aiInFlight--
+      res.end()
+    }
+  })
 
 // Unknown /api/* routes answer with JSON, not Express's default HTML 404.
 app.use("/api", (_req, res) => res.status(404).json({ error: "not found" }))

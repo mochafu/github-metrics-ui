@@ -49,6 +49,16 @@
       </button>
       <div id="breadcrumb" class="breadcrumb"></div>
       <div class="topbar-right">
+        <button id="ai-report-btn" class="ai-btn" title="Generate an AI report for the selected range">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 15l.9 2.6L22.5 18.5l-2.6.9L19 22l-.9-2.6-2.6-.9 2.6-.9z"/>
+          </svg>AI Report
+        </button>
+        <button id="ai-ask-btn" class="ai-btn" title="Ask questions about the metrics">
+          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M21 12a8 8 0 01-8 8H5l-2 2V12a8 8 0 018-8h2a8 8 0 018 8z"/>
+          </svg>Ask AI
+        </button>
         <label class="range-select">
           <span class="range-select-label">Range</span>
           <select id="range-select" aria-label="Time range">
@@ -65,6 +75,24 @@
   </div>
 
   <div id="modal-root" hidden></div>
+
+  <!-- Ask AI drawer: lives outside #modal-root so an open conversation
+       survives route changes (route() clears modals on every navigation). -->
+  <aside id="ask-drawer" hidden aria-label="Ask AI about the metrics">
+    <div class="ask-head">
+      <div>
+        <div class="ask-title">Ask AI</div>
+        <div class="ask-sub">answers computed live from the metrics DB</div>
+      </div>
+      <button id="ask-clear" class="ask-clear" title="Clear conversation">Clear</button>
+      <button id="ask-close" class="modal-x" aria-label="Close">×</button>
+    </div>
+    <div id="ask-msgs"></div>
+    <form id="ask-form">
+      <textarea id="ask-input" rows="2" placeholder="e.g. Which repos are trending down this quarter?" aria-label="Question"></textarea>
+      <button type="submit" id="ask-send" class="ask-send" aria-label="Send">Send</button>
+    </form>
+  </aside>
 
 </body>
 </html>
