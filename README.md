@@ -81,8 +81,9 @@ logged per call (`ai report …` / `ai ask …` lines).
 ## How each metric is calculated
 
 All figures come from the collector's raw tables (`commits`, `pull_requests`,
-`pr_reviews`, `workflow_runs`, `issues`, `deployments`, `releases`). Bots are
-excluded via `author_is_bot`. "Default branch" means `main`/`master`.
+`pr_reviews`, `workflow_runs`, `issues`, `deployments`, `releases`). Bot
+*authors* are excluded via `author_is_bot`; bot *reviewers* are counted and
+broken out (see PR reviews below). "Default branch" means `main`/`master`.
 
 | Metric | Exact calculation | Proxy / caveat |
 |---|---|---|
@@ -90,17 +91,17 @@ excluded via `author_is_bot`. "Default branch" means `main`/`master`.
 | **Active contributors** | `count(distinct author_login)` of non-bot commits in the window. | Overview KPI is scoped to the selected range; can't be summed from buckets (would double-count). |
 | **PRs opened / merged** | `count(*)` by `created_at` / count where `merged_at is not null`. | — |
 | **Merge rate** | KPIs & trend: `merged ÷ opened` in the window. Repo/contributor cards: `merged ÷ (merged + closed-unmerged)`. | Two definitions exist; each is labeled where shown. |
-| **Lead time p50/p90** | `percentile_cont` of `(merged_at − created_at)` in hours, over PRs merged in the window. | Proxy for DORA lead time (true DORA is first-commit→deploy). |
+| **Lead time p50/p90** | `percentile_cont` of `(merged_at − created_at)` in hours, over PRs merged in the window. | Proxy for DORA lead time (true DORA is first-commit→deploy). Includes time waiting on review — read alongside time-to-first-review before treating a rise as a slowdown. |
 | **CI pass rate** | `success ÷ (success + failure + other-completed)` workflow runs; org KPI is run-count-weighted across repos. | Counts all workflows, not only deploy pipelines. |
 | **Deploy frequency** | Events per week from the first non-empty rung of the ladder: GitHub Deployments → published Releases → merges to default branch → successful CI on default branch. Reported method says which rung. | Most repos have no real Deployments API signal, so this is usually a merge/CI proxy. |
 | **Change failure rate (CFR)** | `failure ÷ (success + failure)` workflow runs on the default branch. | Proxy — real CFR needs deployment outcomes, which we don't have. |
 | **Time to restore (MTTR)** | Median hours from the **start** of a red streak on the default branch to the next green run (`lag()` collapses consecutive failures to one streak). | Proxy — CI recovery, not production incident recovery. |
 | **Issues opened / closed** | `count(*)` by `created_at` / `closed_at` in the window. Issue close p50 = `percentile_cont` of `closed_at − created_at`. | — |
-| **PR reviews** | `count(*)` of review submissions (`pr_reviews.submitted_at`). Review coverage = merged PRs with ≥1 review ÷ merged PRs. Time-to-first-review p50 = median `first review − PR created`. | — |
+| **PR reviews** | `count(*)` of review submissions (`pr_reviews.submitted_at`), with a separate human-only count (`reviewer_is_bot`). Review coverage = merged PRs with ≥1 review ÷ merged PRs (any-reviewer and human-only variants). Time-to-first-review p50 = median `first review − PR created`, bucketed by when the first review landed. | Bots included by design, always shown split — automation is review activity, but it shouldn't pass silently as human review. |
 | **Work mix / focus** | Grouped by `commit_analysis.change_type` (LLM-classified: feature / bug_fix / refactor / test / docs / config / chore). | Depends on LLM classification coverage. |
 | **Working-patterns punchcard** | `count(*)` of non-bot commits grouped by `extract(dow …)` × `extract(hour …)` of `authored_at`. After-hours = outside 09:00–18:00; weekend = Sat/Sun. | **Timestamps are UTC**, not contributors' local time — read peaks as UTC. |
 | **CI / workflow reliability** | Per `workflow_runs.name`: pass rate = `success ÷ (success+failure)`; retry rate = `run_attempt>1 ÷ runs`; duration p50 = median `updated_at − run_started_at`. | Wall-clock incl. queue time; duration only where both timestamps exist. |
-| **Review health** | Outcome mix from `pr_reviews.state` (approved / changes-requested / commented); coverage = merged PRs with ≥1 human review; reviews-per-PR = reviews ÷ merged PRs. | Only recorded reviews — many PRs merge without a review event, so volumes can be low. |
+| **Review health** | Outcome mix from `pr_reviews.state` (approved / changes-requested / commented), bots included with a human/bot split; coverage = merged PRs with ≥1 review (human-only variant alongside); reviews-per-PR = reviews ÷ merged PRs. | Review rows only advance on review webhooks/resyncs and can lag other tables — the panel and `/api/status` (`latestByTable`) show review-data freshness. |
 | **Issue insights** | Resolution via `state_reason` (completed vs not-planned); backlog age buckets from open-issue `created_at` (<1w / 1–4w / >1mo); comment engagement = median `comments`. | `state_reason` may be null on older issues (shown as untyped). |
 | **Bus factor / concentration** | Per repo: fewest contributors whose commits sum to ≥50% of the repo's commits; top-contributor share = largest author's fraction. | A **risk** signal (knowledge concentration), not a productivity ranking. |
 | **▲▼ delta** | Last **complete** bucket vs the one before it (current still-running bucket excluded). Basis = the range's bucket size (hour/day/week/month). | Not YoY — it is period-over-period at the selected granularity. |

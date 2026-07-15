@@ -246,9 +246,13 @@ const METRICS = {
     datasets: (b) => [line("merge rate", b.map((x) => (x.prsOpened ? x.prsMerged / x.prsOpened : null)), GREEN)],
   },
   leadTime: {
-    label: "Lead time (p50)", sub: "median hours, PR open → merge", fmt: fmtH, lowerIsBetter: true,
+    // neutral: a rise can mean PRs now wait for real review (healthy), not
+    // slower delivery — so the delta chip reports direction without judging it.
+    label: "Lead time (p50)", sub: "median hours, PR open → merge — includes time waiting on review", fmt: fmtH, lowerIsBetter: true, neutral: true,
     primary: (b) => b.leadTimeP50h,
-    datasets: (b) => [line("lead time p50 (h)", b.map((x) => x.leadTimeP50h), AMBER)],
+    // Plot first-review wait alongside: if lead time rises WITH review wait,
+    // PRs are being reviewed instead of self-merged, not delivered slower.
+    datasets: (b) => [line("lead time p50 (h)", b.map((x) => x.leadTimeP50h), AMBER), line("first review p50 (h)", b.map((x) => x.timeToFirstReviewP50h), "#8b5cf6")],
   },
   deploys: {
     label: "Deploys", sub: "deploy-signal events", fmt: num,
@@ -268,9 +272,14 @@ const METRICS = {
     datasets: (b) => [line("opened", b.map((x) => x.issuesOpened), AMBER), line("closed", b.map((x) => x.issuesClosed), GREEN)],
   },
   reviews: {
-    label: "PR reviews", sub: "review submissions", fmt: num,
+    label: "PR reviews", sub: "review submissions — bots included, human line on top", fmt: num,
     primary: (b) => b.reviews,
-    datasets: (b) => [bars("reviews", b.map((x) => x.reviews), "#8b5cf6")],
+    datasets: (b) => [bars("all reviews (incl. bots)", b.map((x) => x.reviews), "#8b5cf6"), line("human reviews", b.map((x) => x.reviewsHuman), GREEN)],
+  },
+  timeToFirstReview: {
+    label: "Time to first review (p50)", sub: "median hours, PR open → first review (any reviewer)", fmt: fmtH, lowerIsBetter: true,
+    primary: (b) => b.timeToFirstReviewP50h,
+    datasets: (b) => [line("first review p50 (h)", b.map((x) => x.timeToFirstReviewP50h), "#8b5cf6")],
   },
 };
 
@@ -284,7 +293,7 @@ function deltaFor(metric, buckets, noun = "period") {
   if (cur == null || prev == null || prev === 0) return null;
   const change = (cur - prev) / Math.abs(prev);
   const good = METRICS[metric].lowerIsBetter ? change < 0 : change > 0;
-  const cls = Math.abs(change) < 0.005 ? "flat" : good ? "up" : "down";
+  const cls = Math.abs(change) < 0.005 || METRICS[metric].neutral ? "flat" : good ? "up" : "down";
   const arrow = change > 0.005 ? "▲" : change < -0.005 ? "▼" : "•";
   const fmt = METRICS[metric].fmt;
   // basis spells out exactly what the % compares: the last COMPLETE bucket vs
@@ -434,8 +443,8 @@ function openMetricModal(metricId, scope = {}) {
     if (m.pctAxis || m.lowerIsBetter) {
       statHtml.push(`<span class="ms">average<b>${m.fmt(vals.length ? sum / vals.length : null)}</b></span>`);
       if (vals.length) {
-        statHtml.push(`<span class="ms">best<b>${m.fmt(m.lowerIsBetter ? Math.min(...vals) : Math.max(...vals))}</b></span>`);
-        statHtml.push(`<span class="ms">worst<b>${m.fmt(m.lowerIsBetter ? Math.max(...vals) : Math.min(...vals))}</b></span>`);
+        statHtml.push(`<span class="ms">${m.neutral ? "lowest" : "best"}<b>${m.fmt(m.lowerIsBetter ? Math.min(...vals) : Math.max(...vals))}</b></span>`);
+        statHtml.push(`<span class="ms">${m.neutral ? "highest" : "worst"}<b>${m.fmt(m.lowerIsBetter ? Math.max(...vals) : Math.min(...vals))}</b></span>`);
       }
     } else {
       statHtml.push(`<span class="ms">total<b>${num(sum)}</b></span>`);
@@ -910,9 +919,15 @@ async function refreshSidebar() {
         <span class="nav-dot ${hot ? "hot" : ""}"></span>${name}</a>`;
     }).join("") : `<div class="nav-empty">no repos yet</div>`;
     el.querySelectorAll("a").forEach((a) => a.addEventListener("click", closeSidebar));
+    // Reviews sync on a different path than the rest (webhook + resync), so
+    // call out separately when they trail the blended latest-event timestamp.
+    const rvLatest = s.latestByTable?.pr_reviews;
+    const rvLagged = rvLatest && s.latestEvent &&
+      new Date(s.latestEvent) - new Date(rvLatest) > 36 * 3600000;
     $("#sidebar-foot").innerHTML =
       `${num(s.counts.commits)} commits · ${num(s.counts.pull_requests)} PRs · ${num(s.counts.repos)} repos<br>` +
-      `data as of <strong>${esc(fmtDate(s.latestEvent))}</strong>`;
+      `data as of <strong>${esc(fmtDate(s.latestEvent))}</strong>` +
+      (rvLagged ? `<br>reviews through <strong>${esc(fmtDate(rvLatest))}</strong>` : "");
     setActiveNav(currentNavId);
   } catch { /* sidebar is decorative; views surface real errors */ }
 }
@@ -1162,7 +1177,7 @@ async function teamView() {
           <div><div class="card-title">Work mix</div><div class="card-sub">what kind of work the team ships (LLM-classified commits)</div></div>
         </div><div class="chart-box" id="c-mix-box"><canvas id="c-mix"></canvas></div></div>
       <div class="card"><div class="card-head">
-          <div><div class="card-title">Review activity</div><div class="card-sub">PR reviews submitted · ${esc(RANGE_LABEL[state.range])}</div></div>
+          <div><div class="card-title">Review activity</div><div class="card-sub">PR reviews submitted (bots included, human line on top) · ${esc(RANGE_LABEL[state.range])}</div></div>
           <button class="btn-ghost btn" data-open-metric="reviews">history ⤢</button>
         </div><div class="chart-box"><canvas id="c-reviews"></canvas></div></div>
     </div>
@@ -1184,7 +1199,7 @@ async function teamView() {
   } else {
     $("#c-mix-box").innerHTML = `<div class="empty">no classified commits yet</div>`;
   }
-  stdChart($("#c-reviews"), labels, [bars("reviews", b.map((x) => x.reviews), "#8b5cf6")], { legend: false });
+  stdChart($("#c-reviews"), labels, [bars("all reviews (incl. bots)", b.map((x) => x.reviews), "#8b5cf6"), line("human reviews", b.map((x) => x.reviewsHuman), GREEN)], { legend: true });
 
   $("#team-table").appendChild(dataTable({
     columns: [
@@ -1710,10 +1725,12 @@ function reviewHealthHtml(r) {
   return `${bar}
     <div class="mini-stats">
       <span class="ms">review coverage<b>${pct(r.coverage)}</b></span>
+      <span class="ms">human-only coverage<b>${pct(r.coverageHuman)}</b></span>
       <span class="ms">reviews / merged PR<b>${r.reviewsPerMergedPR != null ? r.reviewsPerMergedPR.toFixed(2) : "—"}</b></span>
       <span class="ms">total reviews<b>${num(r.total)}</b></span>
+      <span class="ms">human / bot<b>${num(r.human)} / ${num(r.bot)}</b></span>
     </div>
-    <div class="note" style="margin-top:8px">Coverage = merged PRs with ≥1 human review. Light review volume here means most PRs merge without a recorded review.</div>`;
+    <div class="note" style="margin-top:8px">Coverage = merged PRs with ≥1 review from anyone; the human-only figure excludes bot reviewers. Bot reviews are counted, not hidden — the split above says how much is automation.${r.latestReviewAt ? ` Review data through ${esc(fmtDate(r.latestReviewAt))}.` : ""}</div>`;
 }
 
 function issueInsightsHtml(r) {

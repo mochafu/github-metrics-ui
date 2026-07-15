@@ -446,7 +446,7 @@ export async function trends(range, repoId = null) {
   const RF = repoId ? "and repo_id=$1" : ""
   const p = repoId ? [repoId] : []
 
-  const [commits, prsOpened, prsMerged, ci, issuesOpened, issuesClosed, reviews] = await Promise.all([
+  const [commits, prsOpened, prsMerged, ci, issuesOpened, issuesClosed, reviews, firstReviews] = await Promise.all([
     rows(
       `select ${B("authored_at")} b, count(*)::int n,
               count(distinct author_login) filter (where author_login is not null)::int c
@@ -483,8 +483,27 @@ export async function trends(range, repoId = null) {
       p
     ),
     rows(
-      `select ${B("submitted_at")} b, count(*)::int n
+      `select ${B("submitted_at")} b, count(*)::int n,
+              count(*) filter (where reviewer_is_bot is not true)::int h
        from pr_reviews where submitted_at is not null ${RF} ${S("submitted_at")} group by 1`,
+      p
+    ),
+    // Time-to-first-review: for PRs whose FIRST review landed in this bucket,
+    // the median hours from PR open to that review — the "waiting on review"
+    // slice of lead time, so a lead-time rise can be attributed (or not) to
+    // review adoption instead of guessed at. Bots included: an automated first
+    // response is still a first response, and the reviews series carries the
+    // human/bot split for context.
+    rows(
+      `select ${B("first_rv")} b, count(*)::int n,
+              percentile_cont(0.5) within group (order by extract(epoch from (first_rv-created_at))/3600.0) p50
+       from (
+         select p.created_at, min(r.submitted_at) first_rv
+         from pull_requests p
+         join pr_reviews r on r.repo_id=p.repo_id and r.pr_number=p.number
+         where r.submitted_at is not null ${repoId ? "and p.repo_id=$1" : ""}
+         group by p.id, p.created_at
+       ) s where first_rv >= created_at ${S("first_rv")} group by 1`,
       p
     ),
   ])
@@ -528,7 +547,7 @@ export async function trends(range, repoId = null) {
   }
 
   // Zero-fill from the first observed (or range-start) bucket through now.
-  const maps = [commits, prsOpened, prsMerged, ci, issuesOpened, issuesClosed, reviews]
+  const maps = [commits, prsOpened, prsMerged, ci, issuesOpened, issuesClosed, reviews, firstReviews]
     .map((list) => Object.fromEntries(list.map((r) => [r.b, r])))
   const allKeys = [...maps.flatMap((m) => Object.keys(m)), ...Object.keys(deployBuckets)]
   let start = cutoff ? bucketKeyFor(trunc, cutoff) : allKeys.sort()[0]
@@ -537,7 +556,7 @@ export async function trends(range, repoId = null) {
   if (start) {
     // hard cap protects against a pathological timestamp far in the past
     for (let k = start, i = 0; k <= end && i < 600; k = nextBucket(trunc, k), i++) {
-      const [cm, po, pm, cir, io, ic, rv] = maps.map((m) => m[k])
+      const [cm, po, pm, cir, io, ic, rv, fr] = maps.map((m) => m[k])
       buckets.push({
         bucket: k,
         commits: cm?.n || 0,
@@ -551,6 +570,8 @@ export async function trends(range, repoId = null) {
         issuesOpened: io?.n || 0,
         issuesClosed: ic?.n || 0,
         reviews: rv?.n || 0,
+        reviewsHuman: rv?.h || 0,
+        timeToFirstReviewP50h: asNum(fr?.p50),
       })
     }
   }
@@ -619,16 +640,25 @@ export async function dataStatus() {
          (select count(*) from deployments)::int    deployments,
          (select count(*) from releases)::int       releases`
     ),
+    // Per-table freshness, not one blended max: tables sync on different paths
+    // (pr_reviews only advances on review webhooks/resyncs), so a single
+    // "latest event" can look current while one table is days behind.
     one(
-      `select greatest(
-         (select max(authored_at) from commits),
-         (select max(created_at) from pull_requests),
-         (select max(created_at) from workflow_runs),
-         (select max(created_at) from issues)
-       ) latest`
+      `select
+         (select max(authored_at)  from commits)       commits,
+         (select max(created_at)   from pull_requests) pull_requests,
+         (select max(submitted_at) from pr_reviews)    pr_reviews,
+         (select max(created_at)   from workflow_runs) workflow_runs,
+         (select max(created_at)   from issues)        issues`
     ),
   ])
-  return { counts, latestEvent: freshest.latest, generatedAt: new Date().toISOString() }
+  const latestByTable = {
+    commits: freshest.commits, pull_requests: freshest.pull_requests,
+    pr_reviews: freshest.pr_reviews, workflow_runs: freshest.workflow_runs,
+    issues: freshest.issues,
+  }
+  const latest = Object.values(latestByTable).filter(Boolean).sort((a, b) => b - a)[0] || null
+  return { counts, latestEvent: latest, latestByTable, generatedAt: new Date().toISOString() }
 }
 
 // ===========================================================================
@@ -727,36 +757,51 @@ export async function workflowInsights(repoId = null) {
 // REVIEW HEALTH — outcome mix (approved / changes-requested / commented),
 // review coverage of merged PRs, and reviews-per-merged-PR. Org-wide or per repo.
 // ===========================================================================
+// Bot reviewers (CI assistants, code-review bots) are COUNTED here, not hidden:
+// they are real review activity, and pretending they don't exist skews every
+// ratio. Transparency instead of filtering — every figure that includes bots
+// ships next to its human-only counterpart, and latestReviewAt says how fresh
+// the review data itself is (reviews can lag other tables between resyncs).
 export async function reviewHealth(repoId = null) {
   const rw = repoId ? "and repo_id=$1" : ""
   const p = repoId ? [repoId] : []
-  const [states, cov] = await Promise.all([
+  const [states, latest, cov] = await Promise.all([
     rows(
-      `select upper(state) state, count(*)::int n from pr_reviews
-       where reviewer_is_bot is not true and state is not null ${rw} group by 1`,
+      `select upper(state) state, count(*)::int n,
+              count(*) filter (where reviewer_is_bot is not true)::int h
+       from pr_reviews where state is not null ${rw} group by 1`,
       p
     ),
+    one(`select max(submitted_at) latest from pr_reviews where true ${rw}`, p),
     one(
       `select count(*)::int merged,
               count(*) filter (where exists (
                 select 1 from pr_reviews r where r.repo_id=p.repo_id and r.pr_number=p.number
+              ))::int reviewed,
+              count(*) filter (where exists (
+                select 1 from pr_reviews r where r.repo_id=p.repo_id and r.pr_number=p.number
                   and r.reviewer_is_bot is not true
-              ))::int reviewed
+              ))::int reviewed_human
        from pull_requests p where merged_at is not null ${repoId ? "and p.repo_id=$1" : ""}`,
       p
     ),
   ])
   const byState = Object.fromEntries(states.map((s) => [s.state, s.n]))
   const total = states.reduce((a, s) => a + s.n, 0)
+  const human = states.reduce((a, s) => a + s.h, 0)
   return {
     total,
+    human,
+    bot: total - human,
     approved: byState.APPROVED || 0,
     changesRequested: byState.CHANGES_REQUESTED || 0,
     commented: byState.COMMENTED || 0,
     dismissed: byState.DISMISSED || 0,
     mergedPRs: cov.merged || 0,
-    coverage: cov.merged ? cov.reviewed / cov.merged : null,
+    coverage: cov.merged ? cov.reviewed / cov.merged : null,          // ≥1 review, any reviewer
+    coverageHuman: cov.merged ? cov.reviewed_human / cov.merged : null, // ≥1 human review
     reviewsPerMergedPR: cov.merged ? total / cov.merged : null,
+    latestReviewAt: latest?.latest || null,
   }
 }
 

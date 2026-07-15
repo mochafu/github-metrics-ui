@@ -44,6 +44,20 @@ Data honesty rules (non-negotiable):
 - Some figures are all-time and some are range-scoped — say which. In trends
   data, the current (last) bucket is usually incomplete; do not read it as a
   decline.
+- Review counts INCLUDE bot reviewers (CI assistants, review bots) and every
+  review figure ships with a human/bot split (reviewsHuman, human/bot fields).
+  When reviews matter to a claim, state the split — a "review spike" that is
+  90% bots is a different story from a human one.
+- Tables can have different freshness: pr_reviews only advances on review
+  webhooks/resyncs and can lag days behind commits/PRs (see per-table
+  timestamps in status). Before claiming reviews declined or went flat, check
+  pr_reviews freshness — missing recent data is not a decline.
+- Lead time (PR open → merge) INCLUDES time waiting on review, and slower is
+  not automatically worse: rising lead time alongside rising review activity
+  or time-to-first-review usually means PRs now get real review instead of
+  being self-merged — a process improvement. Read leadTimeP50h together with
+  reviews/reviewsHuman and timeToFirstReviewP50h before calling a lead-time
+  change concerning, and say which story the data supports.
 - This team's data is still backfilling. State the data-freshness timestamp
   when you have it, and prefer "no data" over guessing when coverage is thin.
 
@@ -77,7 +91,8 @@ Early signals not yet trends, plus data-coverage caveats a reader needs
 
 Style: plain prose, short paragraphs or tight bullet lists; every claim backed
 by a number; no filler. End with a one-line footer: "Data through <latest
-event timestamp> · deploys measured via <method>".
+event timestamp> (reviews through <status.latestByTable.pr_reviews>) ·
+deploys measured via <method>".
 
 ${GROUNDING}
 `.trim()
@@ -91,8 +106,14 @@ Snapshot legend:
   comparison regardless of the selected range.
 - overview.totals and overview.repos are ALL-TIME; overview.rangeExtras
   (distinct contributors, lead-time p50) are scoped to the selected range.
-- reviews, issues, workflows, activity are ALL-TIME aggregates.
-- status: row counts per table + latest event timestamp (data freshness).
+- trend buckets carry reviews (all reviewers), reviewsHuman (bots excluded)
+  and timeToFirstReviewP50h (median hours PR open → first review, for PRs
+  first-reviewed in that bucket — the review-wait slice of lead time).
+- reviews, issues, workflows, activity are ALL-TIME aggregates. reviews
+  includes bots with an explicit human/bot split, coverage (any reviewer) vs
+  coverageHuman, and latestReviewAt (freshness of review data itself).
+- status: row counts per table + latestByTable (per-table freshness — compare
+  pr_reviews against commits/pull_requests to spot lagging review data).
 `.trim()
 
 // Reports are expensive (one Opus call over a big snapshot), so cache per
@@ -204,7 +225,8 @@ async function buildTools() {
       name: "get_trends",
       description:
         "Time series (per-bucket: commits, activeContributors, PRs opened/merged, leadTimeP50h, " +
-        "ciRuns, ciPassRate, deploys, issues opened/closed, reviews) for a range, org-wide or one repo. " +
+        "ciRuns, ciPassRate, deploys, issues opened/closed, reviews incl. bots, reviewsHuman, " +
+        "timeToFirstReviewP50h) for a range, org-wide or one repo. " +
         "Bucket sizes: 1d=hourly, 1w=daily, 6w=weekly, 12m/all=monthly. The last bucket is usually incomplete.",
       inputSchema: {
         type: "object", properties: { range: rangeProp, repoId: repoIdProp },
@@ -216,8 +238,9 @@ async function buildTools() {
     betaTool({
       name: "get_review_health",
       description:
-        "PR review outcomes (approved/changes-requested/commented), review coverage of merged PRs, " +
-        "and reviews per merged PR. All-time. Org-wide or one repo.",
+        "PR review outcomes (approved/changes-requested/commented), human/bot reviewer split, " +
+        "review coverage of merged PRs (any-reviewer and human-only), reviews per merged PR, and " +
+        "latestReviewAt (review-data freshness). All-time. Org-wide or one repo.",
       inputSchema: repoInput(),
       run: j(({ repoId }) => reviewHealth(checkRepoId(repoId))),
     }),
@@ -263,7 +286,9 @@ async function buildTools() {
     }),
     betaTool({
       name: "get_data_status",
-      description: "Row counts per table and the latest event timestamp — data freshness/coverage.",
+      description:
+        "Row counts per table plus latestByTable per-table freshness timestamps — check this before " +
+        "reading a recent flat/declining series as real (pr_reviews in particular can lag other tables).",
       inputSchema: noInput,
       run: j(() => dataStatus()),
     }),
